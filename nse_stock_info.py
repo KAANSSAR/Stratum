@@ -106,9 +106,9 @@ def fetch_bhavcopy_with_fallback(target_date):
     """
     Attempts to fetch the daily Bhavcopy (market snapshot file) for the given date. 
     If the market was closed (weekend/holiday), it loops backwards day-by-day 
-    (up to 10 days) until it find the most recent valid file.
+    (up to 30 days) until it finds the most recent valid file.
     """
-    for i in range(10):
+    for i in range(30):
         test_dt = target_date - timedelta(days=i)
         date_str = test_dt.strftime('%d-%m-%Y')
         try:
@@ -128,8 +128,8 @@ def fill_missing_bhavcopy_prices(missing_symbols, start_date):
     results = {sym: {'price': None, 'date': None} for sym in missing_symbols}
     current_date = start_date - timedelta(days=1)
     
-    # Search backwards for up to 14 calendar days
-    for _ in range(14):
+    # Search backwards for up to 30 calendar days
+    for _ in range(30):
         if not missing_symbols:
             break # Found all of them
             
@@ -152,21 +152,91 @@ def fill_missing_bhavcopy_prices(missing_symbols, start_date):
         
     return results
 
+def get_validated_input(prompt, valid_options=None, is_date=False):
+    """
+    Helper to get validated input from the user.
+    """
+    while True:
+        user_input = input(prompt).strip()
+        if is_date:
+            try:
+                return datetime.strptime(user_input, '%Y-%m-%d').date()
+            except ValueError:
+                print("Invalid date format. Please use YYYY-MM-DD.")
+                continue
+        
+        if valid_options:
+            if user_input in valid_options:
+                return user_input
+            print(f"Invalid option. Please choose from {', '.join(valid_options)}.")
+            continue
+        
+        return user_input
+
 def main():
     """
     Main execution flow:
-    1. Parse command line arguments.
-    2. Fetch current live data (snapshot).
-    3. If -c is provided, fetch historical Bhavcopies and compare prices.
+    1. Interactive terminal prompts for End Date and Start Date.
+    2. Fetch current live data (snapshot) for metadata.
+    3. Fetch Bhavcopies for End Date (if historical) and Start Date.
     4. Calculate percentage change.
-    5. Print top 20 symbols and optionally export to CSV.
+    5. Print top 20 symbols and always export to CSV.
     """
-    parser = argparse.ArgumentParser(description="NSE India Stock Info fetcher")
-    parser.add_argument('-c', '--compare', type=str, help="Comparison timeframe (1w, 1m, ytd, or YYYY-MM-DD)")
-    parser.add_argument('--csv', action='store_true', help="Export to CSV")
-    args = parser.parse_args()
+    print("\n=== NSE India Stock Performance Tool ===\n")
 
-    # Step 1: Get current live Snapshot
+    # Prompt 1: End Date selection
+    today = datetime.today().date()
+    print(f"What day do you want to do the comparison?")
+    print(f"1. Present day ({today})")
+    print("2. Custom date")
+    end_choice = get_validated_input("Choose option (1-2): ", ['1', '2'])
+
+    if end_choice == '1':
+        target_end_date = today
+        is_end_today = True
+    else:
+        target_end_date = get_validated_input("Enter End Date (YYYY-MM-DD): ", is_date=True)
+        is_end_today = False
+
+    # Prompt 2: Comparison Period selection
+    print("\nHow do you want to compare?")
+    print("1. Days")
+    print("2. Weeks")
+    print("3. Months")
+    print("4. Years")
+    print("5. YTD")
+    print("6. Custom date")
+    comp_choice = get_validated_input("Choose option (1-6): ", ['1', '2', '3', '4', '5', '6'])
+
+    target_start_date = None
+    if comp_choice == '5':
+        target_start_date = datetime(target_end_date.year, 1, 1).date()
+    elif comp_choice == '6':
+        target_start_date = get_validated_input("Enter Start Date (YYYY-MM-DD): ", is_date=True)
+    else:
+        units = ""
+        if comp_choice == '1': units = "Days"
+        elif comp_choice == '2': units = "Weeks"
+        elif comp_choice == '3': units = "Months"
+        else: units = "Years"
+        
+        count_str = get_validated_input(f"Enter how many {units} ago you want to compare to {target_end_date}: ")
+        try:
+            count = int(count_str)
+            if comp_choice == '1': target_start_date = target_end_date - timedelta(days=count)
+            elif comp_choice == '2': target_start_date = target_end_date - timedelta(weeks=count)
+            elif comp_choice == '3': target_start_date = target_end_date - timedelta(days=30*count)
+            else: target_start_date = target_end_date - timedelta(days=365*count)
+        except ValueError:
+            print("Invalid number. Defaulting to 1 unit ago.")
+            if comp_choice == '1': target_start_date = target_end_date - timedelta(days=1)
+            elif comp_choice == '2': target_start_date = target_end_date - timedelta(weeks=1)
+            elif comp_choice == '3': target_start_date = target_end_date - timedelta(days=30)
+            else: target_start_date = target_end_date - timedelta(days=365)
+
+    print(f"\nComparing {target_start_date} vs {target_end_date}...")
+
+    # Step 1: Get metadata and live prices (if end is today)
     snapshot_data = get_snapshot()
     if not snapshot_data:
         print("Error: Could not fetch snapshot. NSE might be blocking the request.")
@@ -184,111 +254,173 @@ def main():
             'Open': item.get('open'),
             'High': item.get('dayHigh'),
             'Low': item.get('dayLow'),
-            'Close': item.get('lastPrice'),
+            'Snapshot_Price': item.get('lastPrice'),
             'Prev_Close': item.get('previousClose'),
-            'Trades': item.get('totalTradedVolume'),
+            'No_of_Trades': item.get('totalTradedVolume'),
             'Turnover': item.get('totalTradedValue'),
-            'Industry': item.get('meta', {}).get('industry', 'N/A')
+            'Industry': item.get('meta', {}).get('industry', 'N/A'),
         })
-        
     df = pd.DataFrame(rows)
 
-    # Step 2: Handle Comparison Target
-    if args.compare:
-        target_date = calculate_target_date(args.compare)
-        target_str = target_date.strftime('%Y-%m-%d')
-        print(f"Comparing against Target: {target_str}")
-        
-        print("Fetching historical Bhavcopy snapshot... (this takes ~1 second)")
-        valid_date, bhav_df = fetch_bhavcopy_with_fallback(target_date)
-        
-        hist_rows = []
-        alerts_flag = False
-        
-        if valid_date is not None:
-            valid_date_str = valid_date.strftime('%Y-%m-%d')
-            
-            # Did we have to fallback to find the master Bhavcopy?
-            global_fallback_alert = ""
-            if valid_date != target_date:
-                global_fallback_alert = f"Substituting {target_str} with {valid_date_str}"
-                alerts_flag = True
+    # Step 2: Fetch Prices for End Date (with per-stock fallback)
+    actual_end_date_str = ""
+    if is_end_today:
+        # Use snapshot prices as the base; track the date per-stock
+        df['End_Price'] = df['Snapshot_Price']
+        actual_end_date_str = today.strftime('%Y-%m-%d')
+        df['End_Date_Actual'] = actual_end_date_str
 
-            missing_symbols = set()
-            
-            # First pass: map everything from the master Bhavcopy
-            for sym in symbols:
-                match = bhav_df[bhav_df['SYMBOL'] == sym]
-                if not match.empty:
-                    # nsepython get_bhavcopy usually has space-prefixed column names: ' CLOSE_PRICE'
-                    close_price = match.iloc[0][' CLOSE_PRICE']
-                    hist_rows.append({
-                        'Code': sym, 
-                        'Comp_Date': valid_date_str, 
-                        'Comp_Price': close_price, 
-                        'Alert': global_fallback_alert
-                    })
-                else:
-                    # The stock wasn't in the Bhavcopy today
-                    missing_symbols.add(sym)
-                    
-            # Second pass: recursively find older prices for any missing individual stocks
-            if missing_symbols:
-                print(f"Notice: {len(missing_symbols)} stocks had no data on {valid_date_str}. Searching older records for them...")
-                missing_results = fill_missing_bhavcopy_prices(missing_symbols, valid_date)
-                
-                for sym, result in missing_results.items():
-                    if result['price'] is not None:
-                        # Convert their specific date back to YYYY-MM-DD for reporting
-                        dt = datetime.strptime(result['date'], '%d-%m-%Y')
-                        fmt_date = dt.strftime('%Y-%m-%d')
-                        hist_rows.append({
-                            'Code': sym,
-                            'Comp_Date': fmt_date,
-                            'Comp_Price': result['price'],
-                            'Alert': f"Stock didn't trade on {valid_date_str}. Used older price from {fmt_date}."
-                        })
-                        alerts_flag = True
-                    else:
-                        hist_rows.append({
-                            'Code': sym,
-                            'Comp_Date': None,
-                            'Comp_Price': None,
-                            'Alert': "No recent trade data found."
-                        })
-            
-            # Step 3: Merge and calculate change percentages
-            hist_df = pd.DataFrame(hist_rows)
-            df = df.merge(hist_df, on='Code', how='left')
-            
-            df['Comp_Price'] = pd.to_numeric(df['Comp_Price'], errors='coerce')
-            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-            df['Change_%'] = ((df['Close'] - df['Comp_Price']) / df['Comp_Price'] * 100).round(2)
-            
-            if alerts_flag:
-                print("\n*** Notice: Holiday/weekend substitutions made. See 'Alert' column for details. ***\n")
-        else:
-            print("Error: Could not retrieve ANY historical Bhavcopy for the target week.")
+        # Find stocks where the snapshot had no price
+        missing_end_mask = df['End_Price'].isnull()
+        missing_end_syms = set(df.loc[missing_end_mask, 'Code'].tolist())
+
+        if missing_end_syms:
+            print(f"Notice: {len(missing_end_syms)} stocks missing from live snapshot. Fetching from latest bhavcopy...")
+            valid_end, end_bhav = fetch_bhavcopy_with_fallback(today)
+            if valid_end and end_bhav is not None:
+                for sym in list(missing_end_syms):
+                    match = end_bhav[end_bhav['SYMBOL'] == sym]
+                    if not match.empty:
+                        df.loc[df['Code'] == sym, 'End_Price'] = match.iloc[0][' CLOSE_PRICE']
+                        df.loc[df['Code'] == sym, 'End_Date_Actual'] = valid_end.strftime('%Y-%m-%d')
+                        missing_end_syms.discard(sym)
+
+                # If still missing, backfill further
+                if missing_end_syms:
+                    fill_end = fill_missing_bhavcopy_prices(missing_end_syms, valid_end)
+                    for sym, res in fill_end.items():
+                        if res['price'] is not None:
+                            df.loc[df['Code'] == sym, 'End_Price'] = res['price']
+                            df.loc[df['Code'] == sym, 'End_Date_Actual'] = datetime.strptime(res['date'], '%d-%m-%Y').strftime('%Y-%m-%d') if res['date'] else None
+    else:
+        print(f"Fetching historical prices for End Date: {target_end_date}...")
+        valid_end, end_bhav = fetch_bhavcopy_with_fallback(target_end_date)
+        if not valid_end:
+            print("Error: Could not find any trade records for the End Date.")
             return
+        actual_end_date_str = valid_end.strftime('%Y-%m-%d')
 
-    # Step 4: Output Table
+        end_prices = []
+        missing_end = set()
+        for sym in symbols:
+            match = end_bhav[end_bhav['SYMBOL'] == sym]
+            if not match.empty:
+                end_prices.append({'Code': sym, 'End_Price': match.iloc[0][' CLOSE_PRICE'], 'End_Date_Actual': actual_end_date_str})
+            else:
+                missing_end.add(sym)
+
+        if missing_end:
+            print(f"Notice: {len(missing_end)} stocks missing from end day. Backfilling...")
+            fill_end = fill_missing_bhavcopy_prices(missing_end, valid_end)
+            for sym, res in fill_end.items():
+                end_prices.append({
+                    'Code': sym,
+                    'End_Price': res['price'],
+                    'End_Date_Actual': datetime.strptime(res['date'], '%d-%m-%Y').strftime('%Y-%m-%d') if res['date'] else None
+                })
+
+        end_df = pd.DataFrame(end_prices)
+        df = df.merge(end_df, on='Code', how='left')
+
+    # Always remove Snapshot_Price — End_Price is the only price column needed
+    df.drop(columns=['Snapshot_Price'], inplace=True, errors='ignore')
+
+    # Step 3: Fetch Prices for Start Date (with per-stock fallback)
+    print(f"Fetching historical prices for Start Date: {target_start_date}...")
+    valid_start, start_bhav = fetch_bhavcopy_with_fallback(target_start_date)
+    if not valid_start:
+        print("Error: Could not find any trade records for the Start Date.")
+        return
+    actual_start_date_str = valid_start.strftime('%Y-%m-%d')
+
+    start_prices = []
+    missing_start = set()
+    for sym in symbols:
+        match = start_bhav[start_bhav['SYMBOL'] == sym]
+        if not match.empty:
+            start_prices.append({'Code': sym, 'Start_Price': match.iloc[0][' CLOSE_PRICE'], 'Start_Date_Actual': actual_start_date_str})
+        else:
+            missing_start.add(sym)
+
+    if missing_start:
+        print(f"Notice: {len(missing_start)} stocks missing from start day. Backfilling...")
+        fill_start = fill_missing_bhavcopy_prices(missing_start, valid_start)
+        for sym, res in fill_start.items():
+            start_prices.append({
+                'Code': sym,
+                'Start_Price': res['price'],
+                'Start_Date_Actual': datetime.strptime(res['date'], '%d-%m-%Y').strftime('%Y-%m-%d') if res['date'] else None
+            })
+
+    start_df = pd.DataFrame(start_prices)
+    df = df.merge(start_df, on='Code', how='left')
+
+    # Step 4: Calculations
+    df['End_Price'] = pd.to_numeric(df['End_Price'], errors='coerce')
+    df['Start_Price'] = pd.to_numeric(df['Start_Price'], errors='coerce')
+
+    # Calculate Change % only where both prices exist
+    mask_both = df['End_Price'].notnull() & df['Start_Price'].notnull()
+    df.loc[mask_both, 'Change_%'] = ((df.loc[mask_both, 'End_Price'] - df.loc[mask_both, 'Start_Price']) / df.loc[mask_both, 'Start_Price'] * 100).round(2)
+
+    # Alert Column Logic
+    df['Alert'] = ""
+
+    # 1. Global Fallback Alert (if the main start date was adjusted for everyone)
+    if actual_start_date_str != target_start_date.strftime('%Y-%m-%d'):
+        df['Alert'] = f"Target was {target_start_date}, but used {actual_start_date_str}"
+
+    # 2. Individual backfill alerts for start date
+    backfilled_start = df['Start_Date_Actual'].notnull() & (df['Start_Date_Actual'] != actual_start_date_str)
+    df.loc[backfilled_start, 'Alert'] = df.loc[backfilled_start, 'Start_Date_Actual'].apply(lambda x: f"Start price from {x}")
+
+    # 3. Individual backfill alerts for end date
+    backfilled_end = df['End_Date_Actual'].notnull() & (df['End_Date_Actual'] != actual_end_date_str)
+    df.loc[backfilled_end, 'Alert'] = df.loc[backfilled_end, 'End_Date_Actual'].apply(lambda x: f"End price from {x}")
+
+    # 4. Missing Data Alert (Never found a price at all)
+    missing_start_mask = df['Start_Price'].isnull()
+    missing_end_mask = df['End_Price'].isnull()
+    df.loc[missing_start_mask, 'Alert'] = "No start data (likely not listed yet)"
+    df.loc[missing_end_mask, 'Alert'] = "No end data found"
+    df.loc[missing_start_mask & missing_end_mask, 'Alert'] = "No data found for either date"
+
+    # Special case for the Index row
+    df.loc[df['Code'].str.contains('NIFTY'), 'Alert'] = "Index row - no individual bhavcopy data"
+
+    # Step 5: Sort and Output
+    # Pull out the NIFTY 500 index row to pin it at the top
+    nifty_row = df[df['Code'].str.contains('NIFTY')]
+    rest = df[~df['Code'].str.contains('NIFTY')]
+
+    # Tier 1: Has Change_% → sort by Change_% descending
+    tier1 = rest[rest['Change_%'].notnull()].sort_values('Change_%', ascending=False)
+    # Tier 2: No Change_% but has End_Price → sort by End_Price descending
+    tier2 = rest[rest['Change_%'].isnull() & rest['End_Price'].notnull()].sort_values('End_Price', ascending=False)
+    # Tier 3: No Change_% and no End_Price → sort alphabetically by Name
+    tier3 = rest[rest['Change_%'].isnull() & rest['End_Price'].isnull()].sort_values('Name')
+
+    df = pd.concat([nifty_row, tier1, tier2, tier3], ignore_index=True)
+
     print("\n--- PERFORMANCE SUMMARY (Top 20) ---")
-    cols = ['Name', 'Code', 'Close', 'Prev_Close', 'Trades']
-    if args.compare: cols += ['Comp_Price', 'Change_%']
-    
+    cols = ['Name', 'Code', 'Start_Price', 'End_Price', 'Change_%']
+
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
-    
+
     print(df[cols].head(20).to_string(index=False, justify='left'))
     print(f"\nProcessed {len(df)} symbols.")
-    
-    # Step 5: Export to CSV
-    if args.csv:
-        try:
-            df.to_csv('nse_output.csv', index=False)
-            print("\nSUCCESS: Full report exported to nse_output.csv")
-        except PermissionError:
-            print("\nERROR: Could not save CSV! Please close 'nse_output.csv' if it is open in another program.")
+
+    # Always export to CSV
+    try:
+        df.to_csv('nse_output.csv', index=False)
+        print(f"\nSUCCESS: Full report exported to nse_output.csv")
+        print(f"Comparison: {actual_start_date_str} to {actual_end_date_str}")
+    except PermissionError:
+        print("\nERROR: Could not save CSV! Please close 'nse_output.csv' if it is open in another program.")
+
+
 
 if __name__ == '__main__':
     main()
+
